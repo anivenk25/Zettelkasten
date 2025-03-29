@@ -11,8 +11,8 @@ const NEO4J_URI = process.env.NEO4J_URI || "";
 const NEO4J_USER = process.env.NEO4J_USER || "";
 const NEO4J_PASSWORD = process.env.NEO4J_PASSWORD || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const EMBEDDING_MODEL = "text-embedding-ada-002"; // OpenAI embedding model
-const VECTOR_DIMENSION = 1536; // Dimension for Ada embeddings
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "text-embedding-ada-002"; // OpenAI embedding model
+const VECTOR_DIMENSION = process.env.VECTOR_DIMENSION || 1536; // Dimension for Ada embeddings
 export class KnowledgeBase {
     neo4jDriver;
     pineconeClient;
@@ -34,7 +34,7 @@ export class KnowledgeBase {
                 await this.pineconeClient.createIndex({
                     name: PINECONE_INDEX_NAME,
                     metric: "cosine",
-                    dimension: VECTOR_DIMENSION,
+                    dimension: parseInt(VECTOR_DIMENSION.toString()),
                     spec: {
                         serverless: {
                             cloud: "aws",

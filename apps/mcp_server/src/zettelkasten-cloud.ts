@@ -4,7 +4,6 @@ import express, { Express, Request, Response } from "express";
 import cors from "cors";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 const knowledgeBase = new KnowledgeBase();
 
@@ -65,20 +64,12 @@ app.get("/sse", async (req: Request, res: Response) => {
   transport = new SSEServerTransport("/get-msg-context", res);
   await server.connect(transport);
 });
+
 app.post("/get-msg-context", async (req: Request, res: Response) => {
   await transport.handlePostMessage(req, res);
 });
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`MCP SSE Server running on port ${PORT}`);
-});
-
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-}
-
-main().catch((error) => {
-  process.stderr.write("Fatal error in main():", error);
-  process.exit(1);
 });
