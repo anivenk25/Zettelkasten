@@ -54,24 +54,30 @@ export class KnowledgeBase {
   }
 
   private async initPineconeClient(): Promise<void> {
-    const indexesList = await this.pineconeClient.listIndexes();
-    if (!indexesList.indexes?.find((im) => im.name == PINECONE_INDEX_NAME)) {
-      await this.pineconeClient.createIndex({
-        name: PINECONE_INDEX_NAME,
-        metric: "cosine",
-        dimension: VECTOR_DIMENSION,
-        spec: {
-          serverless: {
-            cloud: "aws",
-            region: "us-east-1",
+    try {
+      const indexesList = await this.pineconeClient.listIndexes();
+
+      if (!indexesList.indexes?.find((im) => im.name == PINECONE_INDEX_NAME)) {
+        await this.pineconeClient.createIndex({
+          name: PINECONE_INDEX_NAME,
+          metric: "cosine",
+          dimension: VECTOR_DIMENSION,
+          spec: {
+            serverless: {
+              cloud: "aws",
+              region: "us-east-1",
+            },
           },
-        },
-      });
+        });
+      } else {
+      }
+
+      this.pineconeIndex = this.pineconeClient.Index(PINECONE_INDEX_NAME);
+
+      await this.initDatabase();
+    } catch (error) {
+      throw error;
     }
-
-    this.pineconeIndex = this.pineconeClient.Index(PINECONE_INDEX_NAME);
-
-    await this.initDatabase();
   }
 
   private async initDatabase(): Promise<void> {
@@ -96,18 +102,23 @@ export class KnowledgeBase {
         CREATE INDEX message_vector_id IF NOT EXISTS 
         FOR (m:Message) ON (m.vector_id)
       `);
+    } catch (error) {
+      throw error;
     } finally {
       await session.close();
     }
   }
 
   private async generateEmbedding(text: string): Promise<number[]> {
-    const response = await this.openai.embeddings.create({
-      model: EMBEDDING_MODEL,
-      input: text,
-    });
-
-    return response.data[0].embedding;
+    try {
+      const response = await this.openai.embeddings.create({
+        model: EMBEDDING_MODEL,
+        input: text,
+      });
+      return response.data[0].embedding;
+    } catch (error) {
+      throw error;
+    }
   }
 
   public async storeMessage(
@@ -124,7 +135,7 @@ export class KnowledgeBase {
     try {
       const embedding = await this.generateEmbedding(messageContent);
 
-      await this.pineconeIndex.namespace("context").upsert([
+      await this.pineconeIndex.namespace(userId).upsert([
         {
           id: vectorId,
           values: embedding,
@@ -168,13 +179,14 @@ export class KnowledgeBase {
             metadataJson: JSON.stringify(metadata),
           },
         );
+      } catch (error) {
+        throw error;
       } finally {
         await session.close();
       }
 
       return messageId;
     } catch (error) {
-      console.error("Error storing message:", error);
       throw error;
     }
   }
@@ -187,7 +199,7 @@ export class KnowledgeBase {
     try {
       const queryEmbedding = await this.generateEmbedding(queryText);
 
-      const queryResponse = await this.pineconeIndex.query({
+      const queryResponse = await this.pineconeIndex.namespace(userId).query({
         vector: queryEmbedding,
         topK,
         includeMetadata: true,
@@ -195,6 +207,7 @@ export class KnowledgeBase {
       });
 
       const matches = queryResponse.matches || [];
+
       if (matches.length === 0) {
         return { messages: [], relatedSessions: [] };
       }
@@ -236,12 +249,12 @@ export class KnowledgeBase {
 
         const allContextMessages = matches.flatMap((match) => {
           const sessionId = match.metadata?.session_id;
-          return (
-            sessionMessages[sessionId?.toString() || ""]?.map((msg: any) => ({
+          return sessionMessages[sessionId?.toString() || ""]?.map(
+            (msg: any) => ({
               ...msg,
               session_id: sessionId,
               metadata: msg.metadata ? JSON.parse(msg.metadata) : undefined,
-            })) || []
+            }),
           );
         });
 
@@ -249,11 +262,12 @@ export class KnowledgeBase {
           messages: allContextMessages,
           relatedSessions: [...new Set(sessions)],
         };
+      } catch (error) {
+        throw error;
       } finally {
         await session.close();
       }
     } catch (error) {
-      console.error("Error retrieving message context:", error);
       throw error;
     }
   }
@@ -271,7 +285,7 @@ export class KnowledgeBase {
         { sessionId },
       );
 
-      return result.records.map((record) => ({
+      const messages = result.records.map((record) => ({
         content: record.get("content"),
         role: record.get("role"),
         timestamp: record.get("timestamp"),
@@ -279,6 +293,10 @@ export class KnowledgeBase {
           ? JSON.parse(record.get("metadata"))
           : {},
       }));
+
+      return messages;
+    } catch (error) {
+      throw error;
     } finally {
       await session.close();
     }
