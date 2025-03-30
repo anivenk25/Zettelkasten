@@ -13,8 +13,10 @@ const NEO4J_URI = process.env.NEO4J_URI || "";
 const NEO4J_USER = process.env.NEO4J_USER || "";
 const NEO4J_PASSWORD = process.env.NEO4J_PASSWORD || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "text-embedding-ada-002"; // OpenAI embedding model
-const VECTOR_DIMENSION = process.env.VECTOR_DIMENSION || 1536; // Dimension for Ada embeddings
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "text-embedding-ada-002"; 
+const VECTOR_DIMENSION = process.env.VECTOR_DIMENSION || 1536;
+const CONTEXT_CACHE_SIZE = parseInt(process.env.CONTEXT_CACHE_SIZE || "100");
+const SESSION_CACHE_SIZE = parseInt(process.env.SESSION_CACHE_SIZE || "50");
 
 // Types
 export interface MessageMetadata {
@@ -32,12 +34,211 @@ export interface ContextResult {
   relatedSessions: string[];
 }
 
+interface CacheEntry<T> {
+  data: T;
+  timestamp: number;
+  lastAccessed: number;
+  embedding: number[];
+  key: string;
+}
+
+class SemanticCache<T> {
+  private cache: Map<string, CacheEntry<T>>;
+  private maxSize: number;
+  private openai: OpenAI;
+  private cacheHits: number = 0;
+  private cacheMisses: number = 0;
+
+  constructor(maxSize: number, openai: OpenAI) {
+    this.cache = new Map();
+    this.maxSize = maxSize;
+    this.openai = openai;
+  }
+
+  public async get(key: string): Promise<T | null> {
+    const entry = this.cache.get(key);
+    if (entry) {
+      entry.lastAccessed = Date.now();
+      this.cacheHits++;
+      return entry.data;
+    }
+    this.cacheMisses++;
+    return null;
+  }
+
+  public async set(key: string, data: T, queryText: string): Promise<void> {
+    const embedding = await this.generateEmbedding(queryText);
+    
+    if (this.cache.size >= this.maxSize) {
+      await this.evictLeastSimilar(embedding);
+    }
+    
+    this.cache.set(key, {
+      data,
+      timestamp: Date.now(),
+      lastAccessed: Date.now(),
+      embedding,
+      key
+    });
+  }
+
+  public getStats(): { hits: number; misses: number; size: number; hitRate: number } {
+    const total = this.cacheHits + this.cacheMisses;
+    const hitRate = total === 0 ? 0 : this.cacheHits / total;
+    return {
+      hits: this.cacheHits,
+      misses: this.cacheMisses,
+      size: this.cache.size,
+      hitRate
+    };
+  }
+
+  private async generateEmbedding(text: string): Promise<number[]> {
+    try {
+      const response = await this.openai.embeddings.create({
+        model: EMBEDDING_MODEL,
+        input: text,
+      });
+      return response.data[0].embedding;
+    } catch (error) {
+      console.error("Error generating embedding for cache:", error);
+      return new Array(parseInt(VECTOR_DIMENSION.toString())).fill(0);
+    }
+  }
+
+  private async evictLeastSimilar(newEmbedding: number[]): Promise<void> {
+    if (this.cache.size === 0) return;
+
+    const entries = Array.from(this.cache.values());
+    let leastSimilarKey = entries[0].key;
+    let lowestSimilarity = 1.0;
+
+    for (const entry of entries) {
+      const similarity = this.cosineSimilarity(newEmbedding, entry.embedding);
+      
+      const recencyScore = (Date.now() - entry.lastAccessed) / (24 * 60 * 60 * 1000); // Normalize to days
+      const hybridScore = similarity - (recencyScore * 0.2); // Adjust weight as needed
+      
+      if (hybridScore < lowestSimilarity) {
+        lowestSimilarity = hybridScore;
+        leastSimilarKey = entry.key;
+      }
+    }
+
+    this.cache.delete(leastSimilarKey);
+  }
+
+  private cosineSimilarity(a: number[], b: number[]): number {
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+    
+    for (let i = 0; i < a.length; i++) {
+      dotProduct += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    
+    normA = Math.sqrt(normA);
+    normB = Math.sqrt(normB);
+    
+    if (normA === 0 || normB === 0) {
+      return 0;
+    }
+    
+    return dotProduct / (normA * normB);
+  }
+}
+
+class HybridLRUMRUCache<T> {
+  private cache: Map<string, { data: T; timestamp: number; accessCount: number; lastAccessed: number }>;
+  private maxSize: number;
+  private cacheHits: number = 0;
+  private cacheMisses: number = 0;
+
+  constructor(maxSize: number) {
+    this.cache = new Map();
+    this.maxSize = maxSize;
+  }
+
+  public get(key: string): T | null {
+    const entry = this.cache.get(key);
+    if (entry) {
+      // Update access count 
+      entry.accessCount++;
+      entry.lastAccessed = Date.now();
+      this.cacheHits++;
+      return entry.data;
+    }
+    this.cacheMisses++;
+    return null;
+  }
+
+  public set(key: string, data: T): void {
+    if (this.cache.size >= this.maxSize) {
+      this.evict();
+    }
+    
+    this.cache.set(key, {
+      data,
+      timestamp: Date.now(),
+      accessCount: 1,
+      lastAccessed: Date.now()
+    });
+  }
+
+  public getStats(): { hits: number; misses: number; size: number; hitRate: number } {
+    const total = this.cacheHits + this.cacheMisses;
+    const hitRate = total === 0 ? 0 : this.cacheHits / total;
+    return {
+      hits: this.cacheHits,
+      misses: this.cacheMisses,
+      size: this.cache.size,
+      hitRate
+    };
+  }
+
+  private evict(): void {
+    if (this.cache.size === 0) return;
+
+    const entries = Array.from(this.cache.entries());
+    
+    entries.sort((a, b) => {
+      const aEntry = a[1];
+      const bEntry = b[1];
+      
+      const aRecency = Date.now() - aEntry.lastAccessed;
+      const bRecency = Date.now() - bEntry.lastAccessed;
+      
+      // Normalize recency (newer is better, so inverse)
+      const maxRecency = Math.max(aRecency, bRecency);
+      const normalizedARecency = 1 - (aRecency / maxRecency);
+      const normalizedBRecency = 1 - (bRecency / maxRecency);
+      
+      // Normalize frequency (more accesses is better)
+      const maxFreq = Math.max(aEntry.accessCount, bEntry.accessCount);
+      const normalizedAFreq = aEntry.accessCount / maxFreq;
+      const normalizedBFreq = bEntry.accessCount / maxFreq;
+      
+      const aScore = (normalizedAFreq * 0.6) + (normalizedARecency * 0.4);
+      const bScore = (normalizedBFreq * 0.6) + (normalizedBRecency * 0.4);
+      
+      return aScore - bScore;
+    });
+    
+    // Remove lowest hybrid score
+    this.cache.delete(entries[0][0]);
+  }
+}
+
 export class KnowledgeBase {
   private neo4jDriver: neo4j.Driver;
   private pineconeClient: Pinecone;
   //@ts-ignore
   private pineconeIndex: Index;
   private openai: OpenAI;
+  private contextCache: SemanticCache<ContextResult>;
+  private sessionCache: HybridLRUMRUCache<any[]>;
 
   constructor() {
     this.openai = new OpenAI({ apiKey: OPENAI_API_KEY });
@@ -50,6 +251,10 @@ export class KnowledgeBase {
     this.pineconeClient = new Pinecone({
       apiKey: PINECONE_API_KEY,
     });
+    
+    this.contextCache = new SemanticCache<ContextResult>(CONTEXT_CACHE_SIZE, this.openai);
+    this.sessionCache = new HybridLRUMRUCache<any[]>(SESSION_CACHE_SIZE);
+    
     this.initPineconeClient();
   }
 
@@ -179,6 +384,9 @@ export class KnowledgeBase {
             metadataJson: JSON.stringify(metadata),
           },
         );
+        
+        this.sessionCache.set(sessionId, []);
+        
       } catch (error) {
         throw error;
       } finally {
@@ -197,6 +405,13 @@ export class KnowledgeBase {
     topK: number = 5,
   ): Promise<ContextResult> {
     try {
+      const cacheKey = `context_${userId}_${this.hashString(queryText)}_${topK}`;
+      
+      const cachedResult = await this.contextCache.get(cacheKey);
+      if (cachedResult) {
+        return cachedResult;
+      }
+
       const queryEmbedding = await this.generateEmbedding(queryText);
 
       const queryResponse = await this.pineconeIndex.namespace(userId).query({
@@ -209,14 +424,16 @@ export class KnowledgeBase {
       const matches = queryResponse.matches || [];
 
       if (matches.length === 0) {
-        return { messages: [], relatedSessions: [] };
+        const emptyResult = { messages: [], relatedSessions: [] };
+        await this.contextCache.set(cacheKey, emptyResult, queryText);
+        return emptyResult;
       }
 
       const vectorIds = matches.map((match) => match.id);
 
       const session = this.neo4jDriver.session();
       try {
-        const result = await session.run(
+        const neo4jResult = await session.run(
           `
           MATCH (m:Message)
           WHERE m.vector_id IN $vectorIds
@@ -240,7 +457,7 @@ export class KnowledgeBase {
         const sessionMessages: { [key: string]: any[] } = {};
         const sessions: string[] = [];
 
-        result.records.forEach((record) => {
+        neo4jResult.records.forEach((record) => {
           const sessionId = record.get("sessionId");
           const messages = record.get("contextMessages");
           sessionMessages[sessionId] = messages;
@@ -258,10 +475,14 @@ export class KnowledgeBase {
           );
         });
 
-        return {
+        const contextResult = {
           messages: allContextMessages,
           relatedSessions: [...new Set(sessions)],
         };
+        
+        await this.contextCache.set(cacheKey, contextResult, queryText);
+        
+        return contextResult;
       } catch (error) {
         throw error;
       } finally {
@@ -273,33 +494,62 @@ export class KnowledgeBase {
   }
 
   public async getSessionHistory(sessionId: string): Promise<any[]> {
-    const session = this.neo4jDriver.session();
     try {
-      const result = await session.run(
-        `
-        MATCH (m:Message)-[:PART_OF]->(:Session {session_id: $sessionId})
-        RETURN m.content as content, m.role as role, m.timestamp as timestamp,
-               m.metadata as metadata
-        ORDER BY m.timestamp
-      `,
-        { sessionId },
-      );
+      const cachedResult = this.sessionCache.get(sessionId);
+      if (cachedResult) {
+        return cachedResult;
+      }
+      
+      const session = this.neo4jDriver.session();
+      try {
+        const result = await session.run(
+          `
+          MATCH (m:Message)-[:PART_OF]->(:Session {session_id: $sessionId})
+          RETURN m.content as content, m.role as role, m.timestamp as timestamp,
+                 m.metadata as metadata
+          ORDER BY m.timestamp
+        `,
+          { sessionId },
+        );
 
-      const messages = result.records.map((record) => ({
-        content: record.get("content"),
-        role: record.get("role"),
-        timestamp: record.get("timestamp"),
-        metadata: record.get("metadata")
-          ? JSON.parse(record.get("metadata"))
-          : {},
-      }));
-
-      return messages;
+        const messages = result.records.map((record) => ({
+          content: record.get("content"),
+          role: record.get("role"),
+          timestamp: record.get("timestamp"),
+          metadata: record.get("metadata")
+            ? JSON.parse(record.get("metadata"))
+            : {},
+        }));
+        
+        this.sessionCache.set(sessionId, messages);
+        
+        return messages;
+      } catch (error) {
+        throw error;
+      } finally {
+        await session.close();
+      }
     } catch (error) {
       throw error;
-    } finally {
-      await session.close();
     }
+  }
+  
+  public getCacheStats(): { 
+    contextCache: { hits: number; misses: number; size: number; hitRate: number };
+    sessionCache: { hits: number; misses: number; size: number; hitRate: number };
+  } {
+    return {
+      contextCache: this.contextCache.getStats(),
+      sessionCache: this.sessionCache.getStats()
+    };
+  }
+  
+  private hashString(str: string): string {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) - hash) + str.charCodeAt(i);
+      hash |= 0;     }
+    return hash.toString(16); 
   }
 
   public async close(): Promise<void> {
